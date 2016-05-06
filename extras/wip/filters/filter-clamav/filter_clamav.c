@@ -37,6 +37,9 @@ struct clamav {
 	struct iobuf iobuf;
 };
 
+static size_t clamav_limit;
+static enum { CLAMAV_ACCEPT, CLAMAV_REJECT} clamav_strategy;
+
 static void
 clamav_init(struct clamav *cl)
 {
@@ -261,11 +264,12 @@ int
 main(int argc, char **argv)
 {
 	int ch, c = 0, d = 0, v = 0;
-	char *h = NULL, *p = NULL;
+	const char *errstr, *l = NULL;
+	char *h = NULL, *p = NULL, *s = NULL;
 
 	log_init(1);
 
-	while ((ch = getopt(argc, argv, "cdh:p:v")) != -1) {
+	while ((ch = getopt(argc, argv, "cdh:l:p:s:v")) != -1) {
 		switch (ch) {
 		case 'c':
 			c = 1;
@@ -276,8 +280,14 @@ main(int argc, char **argv)
 		case 'h':
 			h = optarg;
 			break;
+		case 'l':
+			l = optarg;
+			break;
 		case 'p':
 			p = optarg;
+			break;
+		case 's':
+			s = optarg;
 			break;
 		case 'v':
 			v |= TRACE_DEBUG;
@@ -293,8 +303,25 @@ main(int argc, char **argv)
 
 	if (h)
 		clamav_host = strip(h);
+
+	if (l) {
+		clamav_limit = strtonum(l, 1, SIZE_T_MAX, &errstr);
+		if (errstr)
+			fatalx("limit option is %s: %s", errstr, l);
+	}
+
 	if (p)
 		clamav_port = strip(p);
+
+	if (s) {
+		s = strip(s);
+		if (strncmp(s, "accept", 6) == 0)
+			clamav_strategy = CLAMAV_ACCEPT;
+		else if (strncmp(s, "reject", 6) == 0)
+			clamav_strategy = CLAMAV_REJECT';
+		else
+			fatalx("bad strategy");
+	}
 
 	log_init(d);
 	log_verbose(v);
