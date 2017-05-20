@@ -541,8 +541,8 @@ AC_RUN_IFELSE(
 # Search for OpenSSL
 saved_CPPFLAGS="$CPPFLAGS"
 saved_LDFLAGS="$LDFLAGS"
-AC_ARG_WITH([ssl-dir],
-	[  --with-ssl-dir=PATH     Specify path to OpenSSL installation ],
+AC_ARG_WITH([libssl],
+	[  --with-libssl=PATH     Specify path to libssl installation ],
 	[
 		if test "x$withval" != "xno" ; then
 			case "$withval" in
@@ -630,8 +630,8 @@ AC_LINK_IFELSE(
 
 
 SMTPD_USER=_smtpd
-AC_ARG_WITH([privsep-user],
-	[  --with-privsep-user=user Specify non-privileged user for privilege separation],
+AC_ARG_WITH([user-smtpd],
+	[  --with-user-smtpd=user Specify non-privileged user for privilege separation (default=_smtpd)],
 	[
 		if test -n "$withval"  &&  test "x$withval" != "xno"  &&  \
 		    test "x${withval}" != "xyes"; then
@@ -921,8 +921,8 @@ fi
 # Looking for programs, paths and files
 
 PRIVSEP_PATH=/var/empty
-AC_ARG_WITH([privsep-path],
-	[  --with-privsep-path=xxx Path for privilege separation chroot (default=/var/empty)],
+AC_ARG_WITH([path-empty],
+	[  --with-path-empty=PATH  Specify path to empty directory (default=/var/empty)],
 	[
 		if test -n "$withval"  &&  test "x$withval" != "xno"  &&  \
 		    test "x${withval}" != "xyes"; then
@@ -996,62 +996,6 @@ AC_SUBST([pkglibexecdir])
 # individual modules
 #
 
-#
-# FILTERS
-#
-HAVE_FILTER_CLAMAV=no
-AC_ARG_WITH([filter-clamav],
-	[  --with-filter-clamav	Enable filter clamav],
-	[
-		if test "x$withval" != "xno" ; then
-			AC_DEFINE([HAVE_FILTER_CLAMAV], [1],
-				[Define if you have filter clamav])
-			HAVE_FILTER_CLAMAV=yes
-		fi
-	]
-)
-AM_CONDITIONAL([HAVE_FILTER_CLAMAV], [test $HAVE_FILTER_CLAMAV = yes])
-
-HAVE_FILTER_DKIM_SIGNER=no
-AC_ARG_WITH([filter-dkim-signer],
-	[  --with-filter-dkim-signer	Enable filter dkim-signer],
-	[
-		if test "x$withval" != "xno" ; then
-			AC_DEFINE([HAVE_FILTER_DKIM_SIGNER], [1],
-				[Define if you have filter dkim-signer])
-			HAVE_FILTER_DKIM_SIGNER=yes
-		fi
-	]
-)
-AM_CONDITIONAL([HAVE_FILTER_DKIM_SIGNER], [test $HAVE_FILTER_DKIM_SIGNER = yes])
-
-HAVE_FILTER_DNSBL=no
-AC_ARG_WITH([filter-dnsbl],
-	[  --with-filter-dnsbl	Enable filter dnsbl],
-	[
-		if test "x$withval" != "xno" ; then
-			AC_DEFINE([HAVE_FILTER_DNSBL], [1],
-				[Define if you have filter dnsbl])
-			HAVE_FILTER_DNSBL=yes
-		fi
-	]
-)
-AM_CONDITIONAL([HAVE_FILTER_DNSBL], [test $HAVE_FILTER_DNSBL = yes])
-
-HAVE_FILTER_LUA=no
-AC_ARG_WITH([filter-lua],
-	[  --with-filter-lua	Enable filter lua],
-	[
-		if test "x$withval" != "xno" ; then
-			AC_DEFINE([HAVE_FILTER_LUA], [1],
-				[Define if you have filter lua])
-			HAVE_FILTER_LUA=yes
-			need_lua=yes
-		fi
-	]
-)
-AM_CONDITIONAL([HAVE_FILTER_LUA], [test $HAVE_FILTER_LUA = yes])
-
 HAVE_FILTER_MONKEY=no
 AC_ARG_WITH([filter-monkey],
 	[  --with-filter-monkey	Enable filter monkey],
@@ -1064,73 +1008,6 @@ AC_ARG_WITH([filter-monkey],
 	]
 )
 AM_CONDITIONAL([HAVE_FILTER_MONKEY], [test $HAVE_FILTER_MONKEY = yes])
-
-HAVE_FILTER_PAUSE=no
-AC_ARG_WITH([filter-pause],
-	[  --with-filter-pause	Enable filter pause],
-	[
-		if test "x$withval" != "xno" ; then
-			AC_DEFINE([HAVE_FILTER_PAUSE], [1],
-				[Define if you have filter pause])
-			HAVE_FILTER_PAUSE=yes
-		fi
-	]
-)
-AM_CONDITIONAL([HAVE_FILTER_PAUSE], [test $HAVE_FILTER_PAUSE = yes])
-
-HAVE_FILTER_PERL=no
-AC_ARG_WITH([filter-perl],
-	[  --with-filter-perl	Enable filter perl],
-	[
-		if test "x$withval" != "xno" ; then
-			AC_DEFINE([HAVE_FILTER_PERL], [1],
-				[Define if you have filter perl])
-			HAVE_FILTER_PERL=yes
-			need_perl=yes
-		fi
-	]
-)
-AM_CONDITIONAL([HAVE_FILTER_PERL], [test $HAVE_FILTER_PERL = yes])
-
-HAVE_FILTER_PYTHON=no
-AC_ARG_WITH([filter-python],
-	[  --with-filter-python	Enable filter python],
-	[
-		if test "x$withval" != "xno" ; then
-			AC_DEFINE([HAVE_FILTER_PYTHON], [1],
-				[Define if you have filter python])
-			HAVE_FILTER_PYTHON=yes
-			need_python=yes
-		fi
-	]
-)
-AM_CONDITIONAL([HAVE_FILTER_PYTHON], [test $HAVE_FILTER_PYTHON = yes])
-
-HAVE_FILTER_REGEX=no
-AC_ARG_WITH([filter-regex],
-	[  --with-filter-regex	Enable filter regex],
-	[
-		if test "x$withval" != "xno" ; then
-			AC_DEFINE([HAVE_FILTER_REGEX], [1],
-				[Define if you have filter regex])
-			HAVE_FILTER_REGEX=yes
-		fi
-	]
-)
-AM_CONDITIONAL([HAVE_FILTER_REGEX], [test $HAVE_FILTER_REGEX = yes])
-
-HAVE_FILTER_SPAMASSASSIN=no
-AC_ARG_WITH([filter-spamassassin],
-	[  --with-filter-spamassassin	Enable filter spamassassin],
-	[
-		if test "x$withval" != "xno" ; then
-			AC_DEFINE([HAVE_FILTER_SPAMASSASSIN], [1],
-				[Define if you have filter spamassassin])
-			HAVE_FILTER_SPAMASSASSIN=yes
-		fi
-	]
-)
-AM_CONDITIONAL([HAVE_FILTER_SPAMASSASSIN], [test $HAVE_FILTER_SPAMASSASSIN = yes])
 
 HAVE_FILTER_STUB=no
 AC_ARG_WITH([filter-stub],
@@ -1607,8 +1484,8 @@ AC_SUBST([REDIS_LDFLAGS])
 # Search for libevent
 saved_CPPFLAGS="$CPPFLAGS"
 saved_LDFLAGS="$LDFLAGS"
-AC_ARG_WITH([libevent-dir],
-	[  --with-libevent-dir=PATH     Specify path to libevent installation ],
+AC_ARG_WITH([libevent],
+	[  --with-libevent=PATH     Specify path to libevent installation ],
 	[
 		if test "x$withval" != "xno" ; then
 			case "$withval" in
@@ -1678,52 +1555,42 @@ AC_CONFIG_FILES([Makefile
 		openbsd-compat/Makefile
 
 		extras/Makefile
-		extras/stable/Makefile
-		extras/wip/Makefile
 
-		extras/wip/filters/Makefile
-		extras/wip/filters/filter-clamav/Makefile
-		extras/wip/filters/filter-dkim-signer/Makefile
-		extras/wip/filters/filter-dnsbl/Makefile
-		extras/wip/filters/filter-lua/Makefile
-		extras/wip/filters/filter-monkey/Makefile
-		extras/wip/filters/filter-pause/Makefile
-		extras/wip/filters/filter-perl/Makefile
-		extras/wip/filters/filter-python/Makefile
-		extras/wip/filters/filter-regex/Makefile
-		extras/wip/filters/filter-spamassassin/Makefile
-		extras/wip/filters/filter-stub/Makefile
-		extras/wip/filters/filter-trace/Makefile
-		extras/wip/filters/filter-void/Makefile
+		extras/filters/Makefile
+		extras/filters/filter-monkey/Makefile
+		extras/filters/filter-stub/Makefile
+		extras/filters/filter-trace/Makefile
+		extras/filters/filter-void/Makefile
 
-		extras/wip/queues/Makefile
-		extras/wip/queues/queue-null/Makefile
-		extras/wip/queues/queue-python/Makefile
-		extras/wip/queues/queue-ram/Makefile
-		extras/wip/queues/queue-stub/Makefile
+		extras/queues/Makefile
+		extras/queues/queue-null/Makefile
+		extras/queues/queue-python/Makefile
+		extras/queues/queue-ram/Makefile
+		extras/queues/queue-stub/Makefile
 
-		extras/wip/schedulers/Makefile
-		extras/wip/schedulers/scheduler-python/Makefile
-		extras/wip/schedulers/scheduler-ram/Makefile
-		extras/wip/schedulers/scheduler-stub/Makefile
+		extras/schedulers/Makefile
+		extras/schedulers/scheduler-python/Makefile
+		extras/schedulers/scheduler-ram/Makefile
+		extras/schedulers/scheduler-stub/Makefile
 
-		extras/wip/tables/Makefile
-		extras/wip/tables/table-passwd/Makefile
-		extras/wip/tables/table-ldap/Makefile
-		extras/wip/tables/table-mysql/Makefile
-		extras/wip/tables/table-postgres/Makefile
-		extras/wip/tables/table-python/Makefile
-		extras/wip/tables/table-redis/Makefile
-		extras/wip/tables/table-socketmap/Makefile
-		extras/wip/tables/table-sqlite/Makefile
-		extras/wip/tables/table-stub/Makefile
+		extras/tables/Makefile
+		extras/tables/table-passwd/Makefile
+		extras/tables/table-ldap/Makefile
+		extras/tables/table-mysql/Makefile
+		extras/tables/table-postgres/Makefile
+		extras/tables/table-python/Makefile
+		extras/tables/table-redis/Makefile
+		extras/tables/table-socketmap/Makefile
+		extras/tables/table-sqlite/Makefile
+		extras/tables/table-stub/Makefile
 
-		extras/wip/tools/Makefile
-		extras/wip/tools/tool-stats/Makefile
+		extras/tools/Makefile
+		extras/tools/tool-stats/Makefile
 		])
 
 #l4761
 AC_OUTPUT
+
 
 # Print summary of options
 

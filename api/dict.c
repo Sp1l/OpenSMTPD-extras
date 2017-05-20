@@ -21,11 +21,11 @@
 #include <sys/tree.h>
 
 #include <err.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "smtpd-defines.h"
-#include "smtpd-api.h"
+#include <smtpd-api.h>
 
 struct dictentry {
 	SPLAY_ENTRY(dictentry)	entry;

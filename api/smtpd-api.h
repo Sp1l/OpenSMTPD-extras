@@ -24,13 +24,20 @@
 #include <sys/tree.h>
 #include <sys/socket.h>
 
+#include <stdio.h>
 #include <netinet/in.h>
 #include <netdb.h>
 
 #include <event.h>
 #include <imsg.h>
 
-#define	FILTER_API_VERSION	 50
+#include "smtpd-defines.h"
+#include "ioev.h"
+#include "iobuf.h"
+#include "log.h"
+#include "rfc2822.h"
+
+#define	FILTER_API_VERSION	 52
 
 enum blockmodes {
 	BM_NORMAL,
@@ -107,8 +114,9 @@ enum filter_event_type {
 	EVENT_CONNECT,
 	EVENT_RESET,
 	EVENT_DISCONNECT,
-	EVENT_COMMIT,
-	EVENT_ROLLBACK,
+	EVENT_TX_BEGIN,
+	EVENT_TX_COMMIT,
+	EVENT_TX_ROLLBACK,
 };
 
 /* XXX - server side requires mfa_session.c update on filter_hook changes */
@@ -122,28 +130,13 @@ enum filter_query_type {
 	QUERY_DATALINE,
 };
 
-/* XXX - server side requires mfa_session.c update on filter_hook changes */
-enum filter_hook_type {
-	HOOK_CONNECT		= 1 << 0,
-	HOOK_HELO		= 1 << 1,
-	HOOK_MAIL		= 1 << 2,
-	HOOK_RCPT		= 1 << 3,
-	HOOK_DATA		= 1 << 4,
-	HOOK_EOM		= 1 << 5,
-	HOOK_RESET		= 1 << 6,
-	HOOK_DISCONNECT		= 1 << 7,
-	HOOK_COMMIT		= 1 << 8,
-	HOOK_ROLLBACK		= 1 << 9,
-	HOOK_DATALINE		= 1 << 10,
-};
-
 struct filter_connect {
 	struct sockaddr_storage	 local;
 	struct sockaddr_storage	 remote;
 	const char		*hostname;
 };
 
-#define PROC_QUEUE_API_VERSION	1
+#define PROC_QUEUE_API_VERSION	2
 
 enum {
 	PROC_QUEUE_OK,
@@ -164,7 +157,7 @@ enum {
 	PROC_QUEUE_MESSAGE_WALK,
 };
 
-#define PROC_SCHEDULER_API_VERSION	1
+#define PROC_SCHEDULER_API_VERSION	2
 
 struct scheduler_info;
 
@@ -232,7 +225,7 @@ struct scheduler_info {
 #define SCHED_MDA		0x10
 #define SCHED_MTA		0x20
 
-#define PROC_TABLE_API_VERSION	1
+#define PROC_TABLE_API_VERSION	2
 
 struct table_open_params {
 	uint32_t	version;
@@ -373,11 +366,20 @@ const char *esc_description(enum enhanced_status_code);
 
 
 /* filter_api.c */
+void  filter_api_session_allocator(void *(*)(uint64_t));
+void  filter_api_session_destructor(void (*)(void *));
+void *filter_api_session(uint64_t);
+
+void  filter_api_transaction_allocator(void *(*)(uint64_t));
+void  filter_api_transaction_destructor(void (*)(void *));
+void *filter_api_transaction(uint64_t);
+
 void filter_api_setugid(uid_t, gid_t);
 void filter_api_set_chroot(const char *);
 void filter_api_no_chroot(void);
-void filter_api_set_udata(uint64_t, void *);
-void *filter_api_get_udata(uint64_t);
+
+void filter_api_data_buffered(void);
+void filter_api_data_buffered_stream(uint64_t);
 
 void filter_api_loop(void);
 int filter_api_accept(uint64_t);
@@ -385,21 +387,27 @@ int filter_api_reject(uint64_t, enum filter_status);
 int filter_api_reject_code(uint64_t, enum filter_status, uint32_t,
     const char *);
 void filter_api_writeln(uint64_t, const char *);
-void filter_api_timer(uint64_t, struct timeval *, void (*)(uint64_t, void *), void *);
+void filter_api_printf(uint64_t id, const char *, ...);
+void filter_api_timer(uint64_t, uint32_t, void (*)(uint64_t, void *), void *);
 const char *filter_api_sockaddr_to_text(const struct sockaddr *);
 const char *filter_api_mailaddr_to_text(const struct mailaddr *);
+
+FILE *filter_api_datahold_open(uint64_t, void (*callback)(uint64_t, FILE *, void *), void *);
+void filter_api_datahold_close(uint64_t);
 
 void filter_api_on_connect(int(*)(uint64_t, struct filter_connect *));
 void filter_api_on_helo(int(*)(uint64_t, const char *));
 void filter_api_on_mail(int(*)(uint64_t, struct mailaddr *));
 void filter_api_on_rcpt(int(*)(uint64_t, struct mailaddr *));
 void filter_api_on_data(int(*)(uint64_t));
-void filter_api_on_dataline(void(*)(uint64_t, const char *));
-void filter_api_on_eom(int(*)(uint64_t, size_t));
+void filter_api_on_msg_line(void(*)(uint64_t, const char *));
+void filter_api_on_msg_start(void(*)(uint64_t));
+void filter_api_on_msg_end(int(*)(uint64_t, size_t));
 void filter_api_on_reset(void(*)(uint64_t));
 void filter_api_on_disconnect(void(*)(uint64_t));
-void filter_api_on_commit(void(*)(uint64_t));
-void filter_api_on_rollback(void(*)(uint64_t));
+void filter_api_on_tx_begin(void(*)(uint64_t));
+void filter_api_on_tx_commit(void(*)(uint64_t));
+void filter_api_on_tx_rollback(void(*)(uint64_t));
 
 const char *proc_name(enum smtp_proc_type);
 const char *imsg_to_str(int);
@@ -473,6 +481,11 @@ void queue_api_set_chroot(const char *);
 void queue_api_set_user(const char *);
 int queue_api_dispatch(void);
 
+/* queue utils */
+uint32_t queue_generate_msgid(void);
+uint64_t queue_generate_evpid(uint32_t);
+int mktmpfile(void);
+
 /* scheduler */
 void scheduler_api_on_init(int(*)(void));
 void scheduler_api_on_insert(int(*)(struct scheduler_info *));
@@ -524,9 +537,12 @@ struct iobuf; /* forward declaration */
 void	*xmalloc(size_t, const char *);
 void	*xcalloc(size_t, size_t, const char *);
 char	*xstrdup(const char *, const char *);
+void	*xmemdup(const void *, size_t, const char *);
 void	 iobuf_xinit(struct iobuf *, size_t, size_t, const char *);
+void	 iobuf_xfqueue(struct iobuf *, const char *, const char *, ...);
 char	*strip(char *);
 int	 base64_encode(unsigned char const *, size_t, char *, size_t);
 int	 base64_decode(char const *, unsigned char *, size_t);
+int	 lowercase(char *, const char *, size_t);
 
 #endif

@@ -35,11 +35,7 @@
 #include <unistd.h>
 #include <grp.h>
 
-#include "smtpd-defines.h"
-#include "smtpd-api.h"
-#include "ioev.h"
-#include "iobuf.h"
-#include "log.h"
+#include <smtpd-api.h>
 
 #define FILTER_HIWAT 65536
 
@@ -72,7 +68,16 @@ struct filter_session {
 		char		*line;
 	} response;
 
-	void			*udata;
+	void			*usession;
+	void			*utx;
+
+	void			*data_buffer;
+	void		       (*data_buffer_cb)(uint64_t, FILE *, void *);
+
+	struct rfc2822_parser	rfc2822_parser;
+	struct dict		headers_replace;
+	struct dict		headers_add;
+
 };
 
 struct filter_timer {
@@ -88,7 +93,6 @@ static const char	*filter_name;
 static struct filter_internals {
 	struct mproc	p;
 
-	uint32_t	hooks;
 	uint32_t	flags;
 
 	uid_t		uid;
@@ -101,14 +105,25 @@ static struct filter_internals {
 		int  (*mail)(uint64_t, struct mailaddr *);
 		int  (*rcpt)(uint64_t, struct mailaddr *);
 		int  (*data)(uint64_t);
-		void (*dataline)(uint64_t, const char *);
-		int  (*eom)(uint64_t, size_t);
+
+		void (*msg_line)(uint64_t, const char *);
+		void (*msg_start)(uint64_t);
+		int  (*msg_end)(uint64_t, size_t);
 
 		void (*disconnect)(uint64_t);
 		void (*reset)(uint64_t);
-		void (*commit)(uint64_t);
-		void (*rollback)(uint64_t);
+
+		void *(*session_alloc)(uint64_t);
+		void (*session_free)(void *);
+
+		void *(*tx_alloc)(uint64_t);
+		void (*tx_free)(void *);
+		void (*tx_begin)(uint64_t);
+		void (*tx_commit)(uint64_t);
+		void (*tx_rollback)(uint64_t);
 	} cb;
+
+	int		data_buffered;
 } fi;
 
 static void filter_api_init(void);
@@ -116,25 +131,30 @@ static void filter_response(struct filter_session *, int, int, const char *);
 static void filter_send_response(struct filter_session *);
 static void filter_register_query(uint64_t, uint64_t, int);
 static void filter_dispatch(struct mproc *, struct imsg *);
-static void filter_dispatch_dataline(uint64_t, const char *);
 static void filter_dispatch_data(uint64_t);
-static void filter_dispatch_eom(uint64_t, size_t);
+static void filter_dispatch_msg_line(uint64_t, const char *);
+static void filter_dispatch_msg_start(uint64_t);
+static void filter_dispatch_msg_end(uint64_t, size_t);
 static void filter_dispatch_connect(uint64_t, struct filter_connect *);
 static void filter_dispatch_helo(uint64_t, const char *);
 static void filter_dispatch_mail(uint64_t, struct mailaddr *);
 static void filter_dispatch_rcpt(uint64_t, struct mailaddr *);
 static void filter_dispatch_reset(uint64_t);
-static void filter_dispatch_commit(uint64_t);
-static void filter_dispatch_rollback(uint64_t);
+static void filter_dispatch_tx_begin(uint64_t);
+static void filter_dispatch_tx_commit(uint64_t);
+static void filter_dispatch_tx_rollback(uint64_t);
 static void filter_dispatch_disconnect(uint64_t);
 
 static void filter_trigger_eom(struct filter_session *);
 static void filter_io_in(struct io *, int);
 static void filter_io_out(struct io *, int);
 static const char *filterimsg_to_str(int);
-static const char *hook_to_str(int);
 static const char *query_to_str(int);
 static const char *event_to_str(int);
+
+static void	data_buffered_setup(struct filter_session *);
+static void	data_buffered_release(struct filter_session *);
+static void	data_buffered_stream_process(uint64_t, FILE *, void *);
 
 
 static void
@@ -209,6 +229,10 @@ filter_dispatch(struct mproc *p, struct imsg *imsg)
 	int			 type;
 	int			 fds[2], fdin, fdout;
 
+#ifdef EXPERIMENTAL
+	log_warnx("filter is EXPERIMENTAL and NOT meant to be used in production.");
+#endif
+
 	if (imsg == NULL) {
 		log_trace(TRACE_FILTERS, "filter-api:%s server closed", filter_name);
 		exit(0);
@@ -229,7 +253,8 @@ filter_dispatch(struct mproc *p, struct imsg *imsg)
 			fatalx("filter-api: exiting");
 		}
 		m_create(p, IMSG_FILTER_REGISTER, 0, 0, -1);
-		m_add_int(p, fi.hooks);
+		/* all hooks for now */
+		m_add_int(p, ~0);
 		m_add_int(p, fi.flags);
 		m_close(p);
 		break;
@@ -248,20 +273,27 @@ filter_dispatch(struct mproc *p, struct imsg *imsg)
 			s->pipe.iev.sock = -1;
 			s->pipe.oev.sock = -1;
 			tree_xset(&sessions, id, s);
+			if (fi.cb.session_alloc)
+				s->usession = fi.cb.session_alloc(id);
 			break;
 		case EVENT_DISCONNECT:
 			filter_dispatch_disconnect(id);
 			s = tree_xpop(&sessions, id);
+			if (fi.cb.session_free && s->usession)
+				fi.cb.session_free(s->usession);
 			free(s);
 			break;
 		case EVENT_RESET:
 			filter_dispatch_reset(id);
 			break;
-		case EVENT_COMMIT:
-			filter_dispatch_commit(id);
+		case EVENT_TX_BEGIN:
+			filter_dispatch_tx_begin(id);
 			break;
-		case EVENT_ROLLBACK:
-			filter_dispatch_rollback(id);
+		case EVENT_TX_COMMIT:
+			filter_dispatch_tx_commit(id);
+			break;
+		case EVENT_TX_ROLLBACK:
+			filter_dispatch_tx_rollback(id);
 			break;
 		default:
 			log_warnx("warn: filter-api:%s bad event %d", filter_name, type);
@@ -310,7 +342,7 @@ filter_dispatch(struct mproc *p, struct imsg *imsg)
 			m_get_u32(&m, &datalen);
 			m_end(&m);
 			filter_register_query(id, qid, type);
-			filter_dispatch_eom(id, datalen);
+			filter_dispatch_msg_end(id, datalen);
 			break;
 		default:
 			log_warnx("warn: filter-api:%s bad query %d", filter_name, type);
@@ -326,7 +358,11 @@ filter_dispatch(struct mproc *p, struct imsg *imsg)
 		fdout = imsg->fd;
 		fdin = -1;
 
-		if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, fds) == -1) {
+		if (fdout == -1) {
+			log_warnx("warn: %016"PRIx64" failed to receive pipe",
+			    id);
+		}
+		else if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, fds) == -1) {
 			log_warn("warn: filter-api:%s socketpair", filter_name);
 			close(fdout);
 		}
@@ -356,6 +392,9 @@ filter_dispatch(struct mproc *p, struct imsg *imsg)
 		m_add_id(&fi.p, id);
 		m_close(&fi.p);
 
+		if (fdin != -1)
+			filter_dispatch_msg_start(id);
+
 		break;
 	}
 }
@@ -369,7 +408,7 @@ filter_register_query(uint64_t id, uint64_t qid, int type)
 
 	s = tree_xget(&sessions, id);
 	if (s->qid) {
-		log_warnx("warn: filter-api:%s query already in progess",
+		log_warnx("warn: filter-api:%s query already in progress",
 		    filter_name);
 		fatalx("filter-api: exiting");
 	}
@@ -401,13 +440,6 @@ filter_dispatch_helo(uint64_t id, const char *helo)
 static void
 filter_dispatch_mail(uint64_t id, struct mailaddr *mail)
 {
-	struct filter_session	*s;
-
-	s = tree_xget(&sessions, id);
-	if (s->tx)
-		fatalx("transaction already started");
-	s->tx = 1;
-
 	if (fi.cb.mail)
 		fi.cb.mail(id, mail);
 	else
@@ -435,17 +467,36 @@ filter_dispatch_data(uint64_t id)
 static void
 filter_dispatch_reset(uint64_t id)
 {
-	filter_dispatch_rollback(id);
+	if (fi.cb.reset)
+		fi.cb.reset(id);
 }
 
 static void
-filter_dispatch_commit(uint64_t id)
+filter_dispatch_tx_begin(uint64_t id)
+{
+	struct filter_session *s;
+
+	s = tree_xget(&sessions, id);
+	if (s->tx)
+		fatalx("tx-begin: session %016"PRIx64" in transaction", id);
+
+	s->tx = 1;
+
+	if (fi.cb.tx_alloc)
+		s->utx = fi.cb.tx_alloc(id);
+
+	if (fi.cb.tx_begin)
+		fi.cb.tx_begin(id);
+}
+
+static void
+filter_dispatch_tx_commit(uint64_t id)
 {
 	struct filter_session	*s;
 
 	s = tree_xget(&sessions, id);
 	if (s->tx == 0)
-		fatalx("commit: session %016"PRIx64" not in transaction", id);
+		fatalx("tx-commit: session %016"PRIx64" not in transaction", id);
 
 	s->tx = 0;
 	io_clear(&s->pipe.oev);
@@ -453,18 +504,26 @@ filter_dispatch_commit(uint64_t id)
 	io_clear(&s->pipe.iev);
 	iobuf_clear(&s->pipe.ibuf);
 
-	if (fi.cb.commit)
-		fi.cb.commit(id);
+	if (fi.cb.tx_commit)
+		fi.cb.tx_commit(id);
+
+	if (fi.cb.tx_free && s->utx) {
+		fi.cb.tx_free(s->utx);
+		s->utx = NULL;
+	}
+
+	if (s->data_buffer)
+		data_buffered_release(s);
 }
 
 static void
-filter_dispatch_rollback(uint64_t id)
+filter_dispatch_tx_rollback(uint64_t id)
 {
 	struct filter_session	*s;
 
 	s = tree_xget(&sessions, id);
 	if (s->tx == 0)
-		return;
+		fatalx("tx-rollback: session %016"PRIx64" not in transaction", id);
 
 	s->tx = 0;
 	io_clear(&s->pipe.oev);
@@ -472,31 +531,51 @@ filter_dispatch_rollback(uint64_t id)
 	io_clear(&s->pipe.iev);
 	iobuf_clear(&s->pipe.ibuf);
 
-	if (fi.cb.rollback)
-		fi.cb.rollback(id);
+	if (fi.cb.tx_rollback)
+		fi.cb.tx_rollback(id);
+
+	if (fi.cb.tx_free && s->utx) {
+		fi.cb.tx_free(s->utx);
+		s->utx = NULL;
+	}
+
+	if (s->data_buffer)
+		data_buffered_release(s);
 }
 
 static void
 filter_dispatch_disconnect(uint64_t id)
 {
-
-	filter_dispatch_rollback(id);
-
 	if (fi.cb.disconnect)
 		fi.cb.disconnect(id);
 }
 
 static void
-filter_dispatch_dataline(uint64_t id, const char *data)
+filter_dispatch_msg_line(uint64_t id, const char *data)
 {
-	if (fi.cb.dataline)
-		fi.cb.dataline(id, data);
+	if (fi.cb.msg_line)
+		fi.cb.msg_line(id, data);
 	else
 		filter_api_writeln(id, data);
 }
 
 static void
-filter_dispatch_eom(uint64_t id, size_t datalen)
+filter_dispatch_msg_start(uint64_t id)
+{
+
+	struct filter_session *s;
+
+	if (fi.data_buffered) {
+		s = tree_xget(&sessions, id);
+		data_buffered_setup(s);
+	}
+
+	if (fi.cb.msg_start)
+		fi.cb.msg_start(id);
+}
+
+static void
+filter_dispatch_msg_end(uint64_t id, size_t datalen)
 {
 	struct filter_session	*s;
 
@@ -537,8 +616,8 @@ filter_trigger_eom(struct filter_session *s)
 	/* if we didn't send the eom to the user do it now */
 	if (!s->pipe.eom_called) {
 		s->pipe.eom_called = 1;
-		if (fi.cb.eom)
-			fi.cb.eom(s->id, s->datalen);
+		if (fi.cb.msg_end)
+			fi.cb.msg_end(s->id, s->datalen);
 		else
 			filter_api_accept(s->id);
 		return;
@@ -589,7 +668,11 @@ filter_io_in(struct io *io, int evt)
 
 		s->pipe.idatalen += len + 1;
 		/* XXX warning: do not clear io from this call! */
-		filter_dispatch_dataline(s->id, line);
+		if (s->data_buffer) {
+			/* XXX handle errors somehow */
+			fprintf(s->data_buffer, "%s\n", line);
+		}
+		filter_dispatch_msg_line(s->id, line);
 		goto nextline;
 
 	case IO_DISCONNECTED:
@@ -644,7 +727,9 @@ filter_io_out(struct io *io, int evt)
 		if (s->pipe.iev.sock == -1 && s->response.ready)
 			break;
 
-		/* just wait for more data to send */
+		/* just wait for more data to send or feed through callback */
+		if (s->data_buffer_cb)
+			s->data_buffer_cb(s->id, s->data_buffer, s);
 		return;
 
 	default:
@@ -677,26 +762,6 @@ filterimsg_to_str(int imsg)
 }
 
 static const char *
-hook_to_str(int hook)
-{
-	switch (hook) {
-	CASE(HOOK_CONNECT);
-	CASE(HOOK_HELO);
-	CASE(HOOK_MAIL);
-	CASE(HOOK_RCPT);
-	CASE(HOOK_DATA);
-	CASE(HOOK_EOM);
-	CASE(HOOK_RESET);
-	CASE(HOOK_DISCONNECT);
-	CASE(HOOK_COMMIT);
-	CASE(HOOK_ROLLBACK);
-	CASE(HOOK_DATALINE);
-	default:
-		return ("HOOK_???");
-	}
-}
-
-static const char *
 query_to_str(int query)
 {
 	switch (query) {
@@ -719,8 +784,9 @@ event_to_str(int event)
 	CASE(EVENT_CONNECT);
 	CASE(EVENT_RESET);
 	CASE(EVENT_DISCONNECT);
-	CASE(EVENT_COMMIT);
-	CASE(EVENT_ROLLBACK);
+	CASE(EVENT_TX_BEGIN);
+	CASE(EVENT_TX_COMMIT);
+	CASE(EVENT_TX_ROLLBACK);
 	default:
 		return ("EVENT_???");
 	}
@@ -754,6 +820,48 @@ imsg_to_str(int imsg)
 /*
  * These functions are callable by filters
  */
+
+void
+filter_api_session_allocator(void *(*f)(uint64_t))
+{
+	fi.cb.session_alloc = f;
+}
+
+void
+filter_api_session_destructor(void (*f)(void *))
+{
+	fi.cb.session_free = f;
+}
+
+void *
+filter_api_session(uint64_t id)
+{
+	struct filter_session	*s;
+
+	s = tree_xget(&sessions, id);
+	return s->usession;
+}
+
+void
+filter_api_transaction_allocator(void *(*f)(uint64_t))
+{
+	fi.cb.tx_alloc = f;
+}
+
+void
+filter_api_transaction_destructor(void (*f)(void *))
+{
+	fi.cb.tx_free = f;
+}
+
+void *
+filter_api_transaction(uint64_t id)
+{
+	struct filter_session	*s;
+
+	s = tree_xget(&sessions, id);
+	return s->utx;
+}
 
 void
 filter_api_setugid(uid_t uid, gid_t gid)
@@ -821,9 +929,6 @@ filter_api_init(void)
 	fi.gid = pw->pw_gid;
 	fi.rootpath = PATH_CHROOT;
 
-	/* XXX just for now */
-	fi.hooks = ~0;
-
 	mproc_init(&fi.p, 0);
 }
 
@@ -832,7 +937,6 @@ filter_api_on_connect(int(*cb)(uint64_t, struct filter_connect *))
 {
 	filter_api_init();
 
-	fi.hooks |= HOOK_CONNECT;
 	fi.cb.connect = cb;
 }
 
@@ -841,7 +945,6 @@ filter_api_on_helo(int(*cb)(uint64_t, const char *))
 {
 	filter_api_init();
 
-	fi.hooks |= HOOK_HELO;
 	fi.cb.helo = cb;
 }
 
@@ -850,7 +953,6 @@ filter_api_on_mail(int(*cb)(uint64_t, struct mailaddr *))
 {
 	filter_api_init();
 
-	fi.hooks |= HOOK_MAIL;
 	fi.cb.mail = cb;
 }
 
@@ -859,7 +961,6 @@ filter_api_on_rcpt(int(*cb)(uint64_t, struct mailaddr *))
 {
 	filter_api_init();
 
-	fi.hooks |= HOOK_RCPT;
 	fi.cb.rcpt = cb;
 }
 
@@ -868,26 +969,31 @@ filter_api_on_data(int(*cb)(uint64_t))
 {
 	filter_api_init();
 
-	fi.hooks |= HOOK_DATA;
 	fi.cb.data = cb;
 }
 
 void
-filter_api_on_dataline(void(*cb)(uint64_t, const char *))
+filter_api_on_msg_line(void(*cb)(uint64_t, const char *))
 {
 	filter_api_init();
 
-	fi.hooks |= HOOK_DATALINE | HOOK_EOM;
-	fi.cb.dataline = cb;
+	fi.cb.msg_line = cb;
 }
 
 void
-filter_api_on_eom(int(*cb)(uint64_t, size_t))
+filter_api_on_msg_start(void(*cb)(uint64_t))
 {
 	filter_api_init();
 
-	fi.hooks |= HOOK_EOM;
-	fi.cb.eom = cb;
+	fi.cb.msg_start = cb;
+}
+
+void
+filter_api_on_msg_end(int(*cb)(uint64_t, size_t))
+{
+	filter_api_init();
+
+	fi.cb.msg_end = cb;
 }
 
 void
@@ -895,7 +1001,6 @@ filter_api_on_reset(void(*cb)(uint64_t))
 {
 	filter_api_init();
 
-	fi.hooks |= HOOK_RESET;
 	fi.cb.reset = cb;
 }
 
@@ -904,26 +1009,31 @@ filter_api_on_disconnect(void(*cb)(uint64_t))
 {
 	filter_api_init();
 
-	fi.hooks |= HOOK_DISCONNECT;
 	fi.cb.disconnect = cb;
 }
 
 void
-filter_api_on_commit(void(*cb)(uint64_t))
+filter_api_on_tx_begin(void(*cb)(uint64_t))
 {
 	filter_api_init();
 
-	fi.hooks |= HOOK_COMMIT;
-	fi.cb.commit = cb;
+	fi.cb.tx_begin = cb;
 }
 
 void
-filter_api_on_rollback(void(*cb)(uint64_t))
+filter_api_on_tx_commit(void(*cb)(uint64_t))
 {
 	filter_api_init();
 
-	fi.hooks |= HOOK_ROLLBACK;
-	fi.cb.rollback = cb;
+	fi.cb.tx_commit = cb;
+}
+
+void
+filter_api_on_tx_rollback(void(*cb)(uint64_t))
+{
+	filter_api_init();
+
+	fi.cb.tx_rollback = cb;
 }
 
 void
@@ -965,24 +1075,6 @@ filter_api_loop(void)
 		log_warn("warn: filter-api:%s event_dispatch", filter_name);
 		fatalx("filter-api: exiting");
 	}
-}
-
-void
-filter_api_set_udata(uint64_t id, void *data)
-{
-	struct filter_session	*s;
-
-	s = tree_xget(&sessions, id);
-	s->udata = data;
-}
-
-void *
-filter_api_get_udata(uint64_t id)
-{
-	struct filter_session	*s;
-
-	s = tree_xget(&sessions, id);
-	return s->udata;
 }
 
 int
@@ -1056,6 +1148,31 @@ filter_api_writeln(uint64_t id, const char *line)
 	io_reload(&s->pipe.oev);
 }
 
+void
+filter_api_printf(uint64_t id, const char *fmt, ...)
+{
+	struct filter_session  *s;
+	va_list			ap;
+	int			len;
+
+	log_trace(TRACE_FILTERS, "filter-api:%s %016"PRIx64" filter_api_printf(%s)",
+	    filter_name, id, fmt);
+
+	s = tree_xget(&sessions, id);
+
+	if (s->pipe.oev.sock == -1) {
+		log_warnx("warn: session %016"PRIx64": write out of sequence", id);
+		return;
+	}
+
+	va_start(ap, fmt);
+	len = iobuf_vfqueue(&s->pipe.obuf, fmt, ap);
+	iobuf_fqueue(&s->pipe.obuf, "\n");
+	va_end(ap);
+	s->pipe.odatalen += len + 1;
+	io_reload(&s->pipe.oev);
+}
+
 static void
 filter_api_timer_cb(int fd, short evt, void *arg)
 {
@@ -1066,15 +1183,16 @@ filter_api_timer_cb(int fd, short evt, void *arg)
 }
 
 void
-filter_api_timer(uint64_t id, struct timeval *tv, void (*cb)(uint64_t, void *), void *arg)
+filter_api_timer(uint64_t id, uint32_t tmo, void (*cb)(uint64_t, void *), void *arg)
 {
 	struct filter_timer *ft = xcalloc(1, sizeof(struct filter_timer), "filter_api_timer");
+	struct timeval tv = { tmo / 1000, (tmo % 1000) * 1000 };
 
 	ft->id = id;
 	ft->cb = cb;
 	ft->arg = arg;
 	evtimer_set(&ft->ev, filter_api_timer_cb, ft);
-	evtimer_add(&ft->ev, tv);
+	evtimer_add(&ft->ev, &tv);
 }
 
 const char *
@@ -1102,4 +1220,211 @@ filter_api_mailaddr_to_text(const struct mailaddr *maddr)
 		return (NULL);
 
 	return (buffer);
+}
+
+
+/* X X X */
+static void
+data_buffered_stream_process(uint64_t id, FILE *fp, void *arg)
+{
+	struct filter_session	*s;
+	size_t	 sz;
+	ssize_t	 len;
+	char	*line = NULL;
+
+	s = tree_xget(&sessions, id);
+	errno = 0;
+	if ((len = getline(&line, &sz, fp)) == -1) {
+		if (errno) {
+			filter_api_reject_code(id, FILTER_FAIL, 421,
+			    "Internal Server Error");
+			return;
+		}
+		filter_api_accept(id);
+		return;
+	}
+	line[strcspn(line, "\n")] = '\0';
+	rfc2822_parser_feed(&s->rfc2822_parser, line);
+	free(line);
+
+	/* XXX - should be driven by parser_feed */
+	if (1)
+		io_callback(&s->pipe.oev, IO_LOWAT);
+}
+
+static void
+default_header_callback(const struct rfc2822_header *hdr, void *arg)
+{
+	struct filter_session	*s = arg;
+	struct rfc2822_line     *l;
+	int                      i = 0;
+
+	TAILQ_FOREACH(l, &hdr->lines, next) {
+		if (i++ == 0) {
+			filter_api_printf(s->id, "%s: %s", hdr->name, l->buffer + 1);
+			continue;
+		}
+		filter_api_printf(s->id, "%s", l->buffer);
+	}
+}
+
+static void
+default_body_callback(const char *line, void *arg)
+{
+	struct filter_session	*s = arg;
+
+	filter_api_writeln(s->id, line);
+}
+
+static void
+header_remove_callback(const struct rfc2822_header *hdr, void *arg)
+{
+}
+
+static void
+header_replace_callback(const struct rfc2822_header *hdr, void *arg)
+{
+	struct filter_session	*s = arg;
+	char			*value;
+	char			*key;
+
+	key = xstrdup(hdr->name, "header_replace_callback");
+	lowercase(key, key, strlen(key)+1);
+
+	value = dict_xget(&s->headers_replace, key);
+	filter_api_printf(s->id, "%s: %s", hdr->name, value);
+	free(key);
+}
+
+static void
+header_eoh_callback(void *arg)
+{
+	struct filter_session	*s = arg;
+	void			*iter;
+	const char		*key;
+	void			*data;
+
+	iter = NULL;
+	while (dict_iter(&s->headers_add, &iter, &key, &data))
+		filter_api_printf(s->id, "%s: %s", key, (char *)data);
+}
+
+void
+data_buffered_setup(struct filter_session *s)
+{
+	FILE   *fp;
+	int	fd;
+	char	pathname[] = "/tmp/XXXXXXXXXX";
+
+	fd = mkstemp(pathname);
+	if (fd == -1)
+		return;
+
+	fp = fdopen(fd, "w+b");
+	if (fp == NULL) {
+		close(fd);
+		return;
+	}
+	unlink(pathname);
+
+	s->data_buffer = fp;
+	s->data_buffer_cb = data_buffered_stream_process;
+
+	rfc2822_parser_init(&s->rfc2822_parser);
+	rfc2822_parser_reset(&s->rfc2822_parser);
+	rfc2822_header_default_callback(&s->rfc2822_parser,
+	    default_header_callback, s);
+	rfc2822_body_callback(&s->rfc2822_parser,
+	    default_body_callback, s);
+	rfc2822_eoh_callback(&s->rfc2822_parser,
+	    header_eoh_callback, s);
+
+	dict_init(&s->headers_replace);
+	dict_init(&s->headers_add);
+}
+
+static void
+data_buffered_release(struct filter_session *s)
+{
+	void	*data;
+
+	rfc2822_parser_release(&s->rfc2822_parser);
+	if (s->data_buffer) {
+		fclose(s->data_buffer);
+		s->data_buffer = NULL;
+	}
+
+	while (dict_poproot(&s->headers_replace, &data))
+		free(data);
+
+	while (dict_poproot(&s->headers_add, &data))
+		free(data);
+}
+
+void
+filter_api_data_buffered(void)
+{
+	fi.data_buffered = 1;
+}
+
+void
+filter_api_data_buffered_stream(uint64_t id)
+{
+	struct filter_session	*s;
+
+	s = tree_xget(&sessions, id);
+	if (s->data_buffer)
+		fseek(s->data_buffer, 0, 0);
+	io_callback(&s->pipe.oev, IO_LOWAT);
+}
+
+void
+filter_api_header_remove(uint64_t id, const char *header)
+{
+	struct filter_session	*s;
+
+	s = tree_xget(&sessions, id);
+	rfc2822_header_callback(&s->rfc2822_parser, header,
+	    header_remove_callback, s);
+}
+
+void
+filter_api_header_replace(uint64_t id, const char *header, const char *fmt, ...)
+{
+	struct filter_session	*s;
+	char			*key;
+	char			*buffer = NULL;
+	va_list			ap;
+
+	s = tree_xget(&sessions, id);
+	va_start(ap, fmt);
+	vasprintf(&buffer, fmt, ap);
+	va_end(ap);
+
+	key = xstrdup(header, "filter_api_header_replace");
+	lowercase(key, key, strlen(key)+1);
+	dict_set(&s->headers_replace, header, buffer);
+	free(key);
+
+	rfc2822_header_callback(&s->rfc2822_parser, header,
+	    header_replace_callback, s);
+}
+
+void
+filter_api_header_add(uint64_t id, const char *header, const char *fmt, ...)
+{
+	struct filter_session	*s;
+	char			*key;
+	char			*buffer = NULL;
+	va_list			ap;
+
+	s = tree_xget(&sessions, id);
+	va_start(ap, fmt);
+	vasprintf(&buffer, fmt, ap);
+	va_end(ap);
+
+	key = xstrdup(header, "filter_api_header_replace");
+	lowercase(key, key, strlen(key)+1);
+	dict_set(&s->headers_add, header, buffer);
+	free(key);
 }
